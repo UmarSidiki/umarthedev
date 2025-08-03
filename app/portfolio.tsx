@@ -6,11 +6,10 @@ import {
   Linking,
   Platform,
   StyleSheet,
-  Text,
-  View
+  View,
 } from "react-native";
 import { WebView, WebViewNavigation } from "react-native-webview";
-import { CacheManager } from "../services/CacheManager";
+import { OfflinePage, WebViewPreloader } from "../components";
 import { ErrorHandler, WebViewError } from "../services/ErrorHandler";
 import { NetworkService } from "../services/NetworkService";
 
@@ -77,34 +76,26 @@ const isSafeExternalLink = (url: string): boolean => {
 };
 
 export default function PortfolioScreen() {
-  const [isLoading, setIsLoading] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
+  const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [loadingProgress, setLoadingProgress] = useState(0);
   const [canGoBack, setCanGoBack] = useState(false);
-  const [canGoForward, setCanGoForward] = useState(false);
-  const [currentUrl, setCurrentUrl] = useState(PORTFOLIO_URL);
   const [isOnline, setIsOnline] = useState(true);
-  const [showOfflineMessage, setShowOfflineMessage] = useState(false);
-  const [webViewSource, setWebViewSource] = useState({ uri: PORTFOLIO_URL });
+  const [webViewReady, setWebViewReady] = useState(false);
+  const [preloaderReady, setPreloaderReady] = useState(false);
+  const [hasLoadedInitially, setHasLoadedInitially] = useState(false);
   const webViewRef = useRef<WebView>(null);
 
-  // Handle offline loading by serving cached content
-  const handleOfflineLoad = useCallback(async () => {
-    try {
-      const cachedContent = await CacheManager.getCachedResource(PORTFOLIO_URL);
-      if (cachedContent) {
-        // Create a data URI with the cached content
-        const dataUri = `data:text/html;charset=utf-8,${encodeURIComponent(
-          cachedContent
-        )}`;
-        setWebViewSource({ uri: dataUri });
-        setShowOfflineMessage(true);
-      } else {
-        setShowOfflineMessage(true);
-      }
-    } catch (error) {
-      console.error("Error loading cached content:", error);
-      setShowOfflineMessage(true);
-    }
+  // Initialize preloader immediately and WebView after a short delay
+  useEffect(() => {
+    // Show preloader immediately
+    setPreloaderReady(true);
+    
+    // Initialize WebView after preloader is ready
+    const timer = setTimeout(() => {
+      setWebViewReady(true);
+    }, 300); // Increased delay to ensure preloader is fully visible
+
+    return () => clearTimeout(timer);
   }, []);
 
   // Monitor network connectivity
@@ -112,11 +103,6 @@ export default function PortfolioScreen() {
     const checkInitialConnectivity = async () => {
       const online = await NetworkService.isOnline();
       setIsOnline(online);
-
-      // If offline on initial load, try to load from cache
-      if (!online) {
-        await handleOfflineLoad();
-      }
     };
 
     checkInitialConnectivity();
@@ -126,22 +112,12 @@ export default function PortfolioScreen() {
         const online =
           networkState.isConnected &&
           networkState.isInternetReachable !== false;
-        const wasOnline = isOnline;
         setIsOnline(online);
-
-        if (!online && wasOnline) {
-          // Just went offline
-          setShowOfflineMessage(true);
-        } else if (online && !wasOnline) {
-          // Just came back online
-          setShowOfflineMessage(false);
-          setWebViewSource({ uri: PORTFOLIO_URL });
-        }
       }
     );
 
     return unsubscribe;
-  }, [isOnline, handleOfflineLoad]);
+  }, []);
 
   // Handle Android hardware back button
   useFocusEffect(
@@ -165,7 +141,9 @@ export default function PortfolioScreen() {
   );
 
   const handleLoadStart = () => {
-    // Removed loading state for Next.js app compatibility
+    if (!hasLoadedInitially) {
+      setLoadingProgress(0.1);
+    }
   };
 
   const handleError = (syntheticEvent: any) => {
@@ -178,13 +156,11 @@ export default function PortfolioScreen() {
     };
 
     ErrorHandler.handleWebViewError(webViewError, "Portfolio WebView");
-    setRefreshing(false);
+    setIsInitialLoading(false);
   };
 
   const handleNavigationStateChange = (navState: WebViewNavigation) => {
     setCanGoBack(navState.canGoBack);
-    setCanGoForward(navState.canGoForward);
-    setCurrentUrl(navState.url);
   };
 
   const handleShouldStartLoadWithRequest = useCallback((request: any) => {
@@ -249,123 +225,82 @@ export default function PortfolioScreen() {
     return false;
   }, []);
 
-  // Enhanced load end handler with caching
-  const handleLoadEndWithCaching = useCallback(
-    async (syntheticEvent: any) => {
-      const { nativeEvent } = syntheticEvent;
-      setRefreshing(false);
+  // Simple load end handler
+  const handleLoadEnd = useCallback(() => {
+    setIsInitialLoading(false);
+    setLoadingProgress(1);
+    setHasLoadedInitially(true);
+  }, []);
 
-      // Cache the loaded page if online
-      if (
-        isOnline &&
-        nativeEvent.url &&
-        nativeEvent.url.includes("umar.is-a.dev")
-      ) {
-        try {
-          // Inject JavaScript to get page content for caching
-          const injectedJS = `
-          (function() {
-            try {
-              const content = document.documentElement.outerHTML;
-              window.ReactNativeWebView.postMessage(JSON.stringify({
-                type: 'pageContent',
-                url: window.location.href,
-                content: content
-              }));
-            } catch (error) {
-              console.error('Error getting page content:', error);
-            }
-          })();
-        `;
+  // Handle loading progress for better UX
+  const handleLoadProgress = useCallback((event: any) => {
+    const progress = event.nativeEvent.progress;
+    setLoadingProgress(progress);
+  }, []);
 
-          if (webViewRef.current) {
-            webViewRef.current.injectJavaScript(injectedJS);
-          }
-        } catch (error) {
-          console.error("Error injecting caching script:", error);
-        }
-      }
-    },
-    [isOnline]
-  );
-
-  // Handle messages from WebView (including page content for caching)
-  const handleMessage = useCallback(
-    async (event: any) => {
-      try {
-        const data = JSON.parse(event.nativeEvent.data);
-
-        if (data.type === "pageContent" && isOnline) {
-          // Cache the page content
-          await CacheManager.cacheResource(data.url, data.content, "text/html");
-        }
-      } catch (error) {
-        console.error("Error handling WebView message:", error);
-      }
-    },
-    [isOnline]
-  );
-
-  // Enhanced refresh handler with cache fallback
-  const handleRefreshWithCache = useCallback(async () => {
-    setRefreshing(true);
-
-    if (!isOnline) {
-      // Try to load from cache when offline
-      await handleOfflineLoad();
-      setRefreshing(false);
-    } else {
-      // Normal refresh when online - reset to original URL
-      setWebViewSource({ uri: PORTFOLIO_URL });
+  // Handle retry function for offline page
+  const handleRetry = useCallback(async () => {
+    const online = await NetworkService.isOnline();
+    if (online) {
+      setIsOnline(true);
       if (webViewRef.current) {
         webViewRef.current.reload();
       }
     }
-  }, [isOnline, handleOfflineLoad]);
+  }, []);
 
   return (
     <View style={styles.container}>
-      {/* Offline message */}
-      {showOfflineMessage && (
-        <View style={styles.offlineContainer}>
-          <Text style={styles.offlineText}>
-            You&apos;re offline. Showing cached content when available.
-          </Text>
-        </View>
-      )}
+      {/* Show offline page when offline */}
+      {!isOnline ? (
+        <OfflinePage onRetry={handleRetry} />
+      ) : (
+        <>
+          {/* Preloader */}
+          {preloaderReady && (
+            <WebViewPreloader
+              isVisible={isInitialLoading}
+              loadingText="Loading Portfolio..."
+              progressValue={loadingProgress}
+            />
+          )}
 
-      {/* WebView without pull-to-refresh wrapper */}
-      <WebView
-        ref={webViewRef}
-        source={webViewSource}
-        style={styles.webview}
-        onLoadStart={handleLoadStart}
-        onLoadEnd={handleLoadEndWithCaching}
-        onError={handleError}
-        onNavigationStateChange={handleNavigationStateChange}
-        onShouldStartLoadWithRequest={handleShouldStartLoadWithRequest}
-        onMessage={handleMessage}
-        // WebView configuration for optimal performance and functionality
-        javaScriptEnabled={true}
-        domStorageEnabled={true}
-        startInLoadingState={false} // We handle loading state manually
-        scalesPageToFit={true}
-        allowsBackForwardNavigationGestures={Platform.OS === "ios"}
-        bounces={true} // Enable bounces for natural scrolling feel
-        scrollEnabled={true} // Enable WebView scrolling
-        // Caching configuration
-        cacheEnabled={true}
-        incognito={false}
-        // Security and compatibility
-        mixedContentMode="compatibility"
-        allowsInlineMediaPlayback={true}
-        mediaPlaybackRequiresUserAction={false}
-        // Performance optimizations
-        renderToHardwareTextureAndroid={true}
-        removeClippedSubviews={true}
-        // User agent (optional - can help with mobile optimization)
-        userAgent="Mozilla/5.0 (Mobile; rv:42.0) Gecko/42.0 Firefox/42.0"
-      />
+          {/* WebView */}
+          {webViewReady && (
+            <WebView
+              ref={webViewRef}
+              source={{ uri: PORTFOLIO_URL }}
+              style={styles.webview}
+              onLoadStart={handleLoadStart}
+              onLoadProgress={handleLoadProgress}
+              onLoadEnd={handleLoadEnd}
+              onError={handleError}
+              onNavigationStateChange={handleNavigationStateChange}
+              onShouldStartLoadWithRequest={handleShouldStartLoadWithRequest}
+              // WebView configuration for optimal performance and functionality
+              javaScriptEnabled={true}
+              domStorageEnabled={true}
+              startInLoadingState={false} // Disable built-in loading state to prevent default preloader flash
+              scalesPageToFit={true}
+              allowsBackForwardNavigationGestures={Platform.OS === "ios"}
+              bounces={false} // Disable bounces to prevent conflicts with scrolling
+              scrollEnabled={true} // Enable WebView scrolling
+              // Caching configuration
+              cacheEnabled={true}
+              incognito={false}
+              // Security and compatibility
+              mixedContentMode="compatibility"
+              allowsInlineMediaPlayback={true}
+              mediaPlaybackRequiresUserAction={false}
+              // Performance optimizations
+              renderToHardwareTextureAndroid={true}
+              removeClippedSubviews={true}
+              // User agent (optional - can help with mobile optimization)
+              userAgent="Mozilla/5.0 (Mobile; rv:42.0) Gecko/42.0 Firefox/42.0"
+            />
+          )}
+        </>
+      )}
     </View>
   );
 }
@@ -373,32 +308,9 @@ export default function PortfolioScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#ffffff",
-  },
-
-  scrollContainer: {
-    flex: 1,
-  },
-  scrollContent: {
-    flex: 1,
+    backgroundColor: "#f9f4e6", // Match the consistent background
   },
   webview: {
     flex: 1,
-  },
-  offlineContainer: {
-    position: "absolute",
-    top: Platform.OS === "ios" ? 44 : 0, // Position below status bar only
-    left: 0,
-    right: 0,
-    backgroundColor: "#FF9500",
-    paddingVertical: 8,
-    paddingHorizontal: 16,
-    zIndex: 2,
-  },
-  offlineText: {
-    color: "#FFFFFF",
-    fontSize: 14,
-    textAlign: "center",
-    fontWeight: "500",
   },
 });
